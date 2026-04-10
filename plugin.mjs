@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 
 const MEMORY_SYSTEM_HINT_MARKER = "anything-agent-memory-hint";
 const PROVIDERS = Object.freeze(["mempalace"]);
+const MEMORY_DEPLOY_DEFAULT_INTERVAL_MINUTES = 360;
 
 const MEMORY_SKILL_CONTENT = `---
 name: memory
@@ -149,6 +150,50 @@ function asPositiveInt(value, fallback) {
   return parsed;
 }
 
+function asOptionalPositiveInt(value, fieldName) {
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`${fieldName} must be a positive integer.`);
+  }
+  return value;
+}
+
+function parseOptionalBooleanFlag(flags, name) {
+  const value = flags[name];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === true) {
+    return true;
+  }
+  if (typeof value === "string") {
+    if (value === "true") {
+      return true;
+    }
+    if (value === "false") {
+      return false;
+    }
+  }
+  throw new Error(`Flag --${name} must be true or false.`);
+}
+
+function parseOptionalPositiveIntFlag(flags, name) {
+  const value = flags[name];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (value === true) {
+    throw new Error(`Flag --${name} requires a numeric value.`);
+  }
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error(`Flag --${name} must be a positive integer.`);
+  }
+  return parsed;
+}
+
 function defaultManifest() {
   return {
     version: 3,
@@ -190,6 +235,61 @@ function resolveProvider(providerId) {
   return providerId;
 }
 
+function normalizeMemoryDeployConfig(section, options = {}) {
+  const deployEnabledDefault = options.deployEnabledDefault ?? true;
+  if (section === undefined) {
+    return {
+      enabled: deployEnabledDefault,
+      maintenance: {
+        intervalMinutes: MEMORY_DEPLOY_DEFAULT_INTERVAL_MINUTES
+      },
+      ingestion: {
+        enabled: false
+      }
+    };
+  }
+
+  const input = asRecord(section);
+  if (!input) {
+    throw new Error("manifest extension 'memory.config.deploy' must be an object.");
+  }
+
+  const enabled = input.enabled === undefined ? deployEnabledDefault : input.enabled;
+  if (typeof enabled !== "boolean") {
+    throw new Error("manifest extension 'memory.config.deploy.enabled' must be a boolean.");
+  }
+
+  const maintenanceInput = input.maintenance === undefined ? {} : input.maintenance;
+  const maintenanceRecord = asRecord(maintenanceInput);
+  if (!maintenanceRecord) {
+    throw new Error("manifest extension 'memory.config.deploy.maintenance' must be an object.");
+  }
+  const intervalMinutes = asOptionalPositiveInt(
+    maintenanceRecord.intervalMinutes ?? MEMORY_DEPLOY_DEFAULT_INTERVAL_MINUTES,
+    "manifest extension 'memory.config.deploy.maintenance.intervalMinutes'"
+  );
+
+  const ingestionInput = input.ingestion === undefined ? {} : input.ingestion;
+  const ingestionRecord = asRecord(ingestionInput);
+  if (!ingestionRecord) {
+    throw new Error("manifest extension 'memory.config.deploy.ingestion' must be an object.");
+  }
+  const ingestionEnabled = ingestionRecord.enabled === undefined ? false : ingestionRecord.enabled;
+  if (typeof ingestionEnabled !== "boolean") {
+    throw new Error("manifest extension 'memory.config.deploy.ingestion.enabled' must be a boolean.");
+  }
+
+  return {
+    enabled,
+    maintenance: {
+      intervalMinutes
+    },
+    ingestion: {
+      enabled: ingestionEnabled
+    }
+  };
+}
+
 function normalizeMemoryConfig(section) {
   if (section === undefined) {
     return {
@@ -213,7 +313,6 @@ function normalizeMemoryConfig(section) {
   if (typeof provider !== "string" || !provider.trim()) {
     throw new Error("manifest extension 'memory.provider' must be a non-empty string.");
   }
-  resolveProvider(provider);
 
   const config = input.config === undefined ? {} : input.config;
   const configRecord = asRecord(config);
@@ -231,10 +330,17 @@ function normalizeMemoryConfig(section) {
     throw new Error("manifest extension 'memory.config.defaultAgentName' must be a string.");
   }
 
+  const normalizedDeployConfig = normalizeMemoryDeployConfig(configRecord.deploy, {
+    deployEnabledDefault: enabled
+  });
+
   return {
     enabled,
     provider,
-    config: { ...configRecord }
+    config: {
+      ...configRecord,
+      deploy: normalizedDeployConfig
+    }
   };
 }
 
@@ -386,11 +492,22 @@ async function enableMemory(targetDir, input) {
   const previous = normalizeMemoryConfig(extensions.memory);
 
   const provider = resolveProvider(input.provider.trim());
+  const previousDeployConfig = normalizeMemoryDeployConfig(previous.config.deploy, { deployEnabledDefault: true });
+  const nextDeployConfig = {
+    enabled: input.deployEnabled ?? previousDeployConfig.enabled,
+    maintenance: {
+      intervalMinutes: input.deployMaintenanceIntervalMinutes ?? previousDeployConfig.maintenance.intervalMinutes
+    },
+    ingestion: {
+      enabled: input.deployIngestionEnabled ?? previousDeployConfig.ingestion.enabled
+    }
+  };
   const nextConfig = {
     ...previous.config,
     ...(input.pythonCommand ? { pythonCommand: input.pythonCommand } : {}),
     ...(input.palacePath ? { palacePath: input.palacePath } : {}),
-    ...(input.defaultAgentName ? { defaultAgentName: input.defaultAgentName } : {})
+    ...(input.defaultAgentName ? { defaultAgentName: input.defaultAgentName } : {}),
+    deploy: nextDeployConfig
   };
 
   const nextMemoryConfig = {
@@ -432,8 +549,93 @@ async function enableMemory(targetDir, input) {
 
 function printUsage(context) {
   context.stderr.write(
-    "Usage: anything-agent memory <enable|doctor|status|search|write> [folder] [--provider <id>] [--python-command <cmd>] [--palace-path <path>] [--json]\\n"
+    "Usage: anything-agent memory <enable|doctor|status|search|write> [folder] [--provider <id>] [--python-command <cmd>] [--palace-path <path>] [--deploy-enabled <true|false>] [--deploy-maintenance-interval-minutes <n>] [--deploy-ingestion-enabled <true|false>] [--json]\\n"
   );
+}
+
+function isSstAwsLambdaTarget(resolvedTarget) {
+  if (!resolvedTarget || !resolvedTarget.manifest || resolvedTarget.manifest.type !== "sst") {
+    return false;
+  }
+  const provider = resolvedTarget.manifest.provider;
+  if (!provider || provider.type !== "aws") {
+    return false;
+  }
+  const providerConfig = asRecord(provider.config);
+  const execution = providerConfig?.execution;
+  if (execution === undefined || execution === "lambda") {
+    return true;
+  }
+  return false;
+}
+
+function createMemoryDeployContribution() {
+  return {
+    id: "memory",
+    summary: "Translate memory extension config into deploy intents for supported targets.",
+    async collect(input) {
+      const memory = memoryConfigFromManifest(input.manifest);
+      if (!memory.enabled || memory.provider !== "mempalace") {
+        return [];
+      }
+
+      const deploy = normalizeMemoryDeployConfig(memory.config.deploy, { deployEnabledDefault: true });
+      if (!deploy.enabled) {
+        return [];
+      }
+      if (!isSstAwsLambdaTarget(input.resolvedTarget)) {
+        return [];
+      }
+
+      const intents = [
+        {
+          kind: "scheduled-task",
+          plugin: "memory",
+          id: "memory-maintenance",
+          enabled: true,
+          description: "Periodic memory maintenance to keep long-term context healthy.",
+          prompt:
+            "Perform memory maintenance for this agent. Consolidate and reconcile recent memory entries, remove obvious duplication, and keep memory state query-friendly.",
+          promptSource: {
+            type: "inline"
+          },
+          metadata: {
+            plugin: "anything-memory-plugin",
+            provider: memory.provider,
+            task: "maintenance"
+          },
+          delivery: {
+            kind: "default"
+          },
+          schedule: {
+            kind: "every-minutes",
+            intervalMinutes: deploy.maintenance.intervalMinutes
+          }
+        }
+      ];
+
+      if (deploy.ingestion.enabled) {
+        intents.push({
+          kind: "event-poller",
+          plugin: "memory",
+          source: "memory",
+          enabled: true,
+          description: "Poll configured memory ingestion source.",
+          metadata: {
+            plugin: "anything-memory-plugin",
+            provider: memory.provider,
+            task: "ingestion"
+          },
+          schedule: {
+            kind: "every-minutes",
+            intervalMinutes: deploy.maintenance.intervalMinutes
+          }
+        });
+      }
+
+      return intents;
+    }
+  };
 }
 
 function createMempalaceProvider() {
@@ -529,7 +731,10 @@ function createMemoryCommandPlugin() {
           provider,
           pythonCommand: stringFlag(flags, "python-command"),
           palacePath: stringFlag(flags, "palace-path"),
-          defaultAgentName: stringFlag(flags, "agent-name")
+          defaultAgentName: stringFlag(flags, "agent-name"),
+          deployEnabled: parseOptionalBooleanFlag(flags, "deploy-enabled"),
+          deployMaintenanceIntervalMinutes: parseOptionalPositiveIntFlag(flags, "deploy-maintenance-interval-minutes"),
+          deployIngestionEnabled: parseOptionalBooleanFlag(flags, "deploy-ingestion-enabled")
         });
 
         if (json) {
@@ -673,6 +878,12 @@ function createMemoryManifestExtension() {
 export async function register(registry) {
   registry.registerCommand(createMemoryCommandPlugin());
   registry.registerManifestExtension(createMemoryManifestExtension());
+  registry.registerCapability({
+    kind: "deploy-contribution",
+    id: "memory",
+    summary: "memory deploy contribution",
+    value: createMemoryDeployContribution()
+  });
 }
 
 export default register;

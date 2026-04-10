@@ -10,6 +10,7 @@ This is a standalone plugin repo (not `anything-agent` core) so memory remains o
 - CLI/text-first behavior
 - provider-pluggable backend (`mempalace` in v1)
 - no MCP dependency in the host integration contract
+- deploy-aware via plugin-owned deploy intents (no core patch required)
 
 ## Install
 
@@ -37,6 +38,19 @@ This command:
 - writes `manifest.extensions.memory`
 - installs `.agents/skills/memory/SKILL.md` if missing
 - appends a minimal memory usage hint to `.pi/SYSTEM.md` if missing
+- sets deploy defaults under `extensions.memory.config.deploy`:
+  - `enabled: true`
+  - `maintenance.intervalMinutes: 360`
+  - `ingestion.enabled: false`
+
+You can override deploy settings during enable:
+
+```bash
+anything-agent memory enable ./my-agent \
+  --deploy-enabled true \
+  --deploy-maintenance-interval-minutes 360 \
+  --deploy-ingestion-enabled false
+```
 
 ## Commands
 
@@ -53,6 +67,23 @@ anything-agent memory write ./my-agent --mode diary --agent-name "my-agent" --to
 V1 provider: `mempalace`.
 
 `doctor` checks availability and returns actionable errors if Python or `mempalace` are not available.
+
+## Deployment-aware behavior
+
+The plugin registers a deploy contribution (`kind: "deploy-contribution", id: "memory"`).
+
+Deploy intents are emitted only when all are true:
+
+- `extensions.memory.enabled === true`
+- `extensions.memory.provider === "mempalace"`
+- deploy target resolves to AWS Lambda path (`sst` target with AWS provider and non-`fargate` execution)
+
+For supported targets:
+
+- always emits a `scheduled-task` maintenance intent (`every-minutes`, default 360)
+- emits an `event-poller` intent only when `extensions.memory.config.deploy.ingestion.enabled === true`
+
+For unsupported targets (`vps`, `fargate`, or non-AWS/non-lambda paths), it emits no memory intents.
 
 ## Tests
 
